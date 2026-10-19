@@ -1,636 +1,495 @@
 """
-Tapal DD 900gm Collectible CP - Streamlit daily updater.
-Run with:  streamlit run app.py
-Requirements:  pip install streamlit pandas openpyxl
+Tapal DD 900gm Collectible - Survey Appender (Streamlit)
+
+Upload:
+  1) the new Tapal survey export (.csv or .xlsx)
+  2) your current  Collectible_Summary_-_BA_Stores.xlsx
+  3) your current  DD_900gm_Mug_CP_Survey_*.xlsx
+The app APPENDS the new dates / stores into both workbooks (old data of other dates is kept)
+and gives you the two updated files to download.
+
+Run:  streamlit run app.py
 """
-import streamlit as st
-import pandas as pd
-
-import re
-import io
-import csv
-import copy
-import difflib
-import datetime as dt
-
+import io, re, csv, copy, zipfile, datetime, difflib, collections, warnings
 import openpyxl
-from openpyxl.utils import get_column_letter as L, column_index_from_string as CI
-from openpyxl.utils.cell import range_boundaries
-from openpyxl.formatting.formatting import ConditionalFormattingList
-from openpyxl.workbook.properties import CalcProperties
+import pandas as pd
+from openpyxl.worksheet.dimensions import ColumnDimension
 
-MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-CS_DAY_RE = re.compile(r"^(\d{1,2})-([A-Za-z]{3})$")                       # "15-Oct"
-DD_DAY_RE = re.compile(r"^Sellout \n\((\d{1,2})(?:st|nd|rd|th) ([A-Za-z]{3}) (\d{4})\)$")
-DD_STATUS_PREFIX = "DD 900gm CP Stock Status"
-REF_RE = re.compile(r"(?<![A-Za-z0-9_.\[!'])(\$?)([A-Z]{1,3})(\$?)(\d+)(?![A-Za-z0-9_(\[!])")
-UPDATED_TILL_RE = re.compile(r"updated till \d{1,2} [A-Za-z]{3} \d{4}")
-FUZZY_CUTOFF = 0.92
-STOCK_FINISHED = "Stock finished"
+warnings.filterwarnings("ignore")
 
+WINDOW = 25                      # number of date columns in both workbooks
+DEFAULT_ALIAS = {                # survey name -> name already used in the workbooks
+    "imitaz supermarket (sialkot)": "imtiaz supermarket (sialkot)",
+    "time store (bahawalpur)": "auniqe super store",
+}
+ADD_NEW = "➕ Add as new store"
 
-# ----------------------------------------------------------------- helpers
-def norm(s):
-    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+norm = lambda x: re.sub(r"\s+", " ", str(x)).strip().lower()
+isnum = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+ordn = lambda n: "%d%s" % (n, "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th"))
 
 
-def clean(s):
-    return re.sub(r"\s+", " ", str(s or "")).strip()
+# ----------------------------------------------------------------------------- survey parsing
+def _to_date(v):
+    if isinstance(v, datetime.datetime): return v.date()
+    if isinstance(v, datetime.date): return v
+    s = str(v).strip()
+    try: return datetime.date.fromisoformat(s[:10])
+    except Exception: return pd.to_datetime(s, dayfirst=False).date()
 
+def _to_time(v):
+    if isinstance(v, datetime.datetime): return v.strftime("%H:%M:%S")
+    if isinstance(v, datetime.time): return v.strftime("%H:%M:%S")
+    p = (str(v).strip().split(" ")[-1]).split(":")
+    p = [x.zfill(2) for x in p] + ["00"] * (3 - len(p))
+    return ":".join(p[:3])
 
-def ordinal(n):
-    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-    return f"{n}{suffix}"
-
-
-def day_key(d):
-    return (d.day, MON[d.month - 1])
-
-
-def cs_label(d):
-    return f"{d.day}-{MON[d.month - 1]}"
-
-
-def dd_label(d):
-    return f"Sellout \n({ordinal(d.day)} {MON[d.month - 1]} {d.year})"
-
-
-def dd_status_label(d):
-    return f"DD 900gm CP Stock Status\n({ordinal(d.day)} {MON[d.month - 1]} {d.year})"
-
-
-def dd_remarks_label(d):
-    return f"Remarks ({d.day:02d}/{d.month:02d}/{d.year})"
-
-
-def to_num(s):
-    s = (s or "").strip()
-    if re.fullmatch(r"-?\d+(\.\d+)?", s):
-        f = float(s)
-        return int(f) if f.is_integer() else f
-    return None
-
-
-def stock_status(q1):
-    """Return (status or None, is_out_of_stock_answer) from the Q1 CP answer."""
-    s = (q1 or "").strip()
-    if not s:
-        return None, False
-    low = s.lower()
-    if low == "out of stock":
-        return "Not Available", True
-    if low in ("not available", "n/a", "na"):
-        return "Not Available", False
-    v = to_num(s)
-    if v is None:
-        return None, False
-    return ("Available" if v > 0 else "Not Available"), False
-
-
-# ----------------------------------------------------------------- survey
-def _parse_ts(time_s, d):
-    """Survey times are not zero-padded (e.g. '20:9:6'), so parse the parts."""
+def _ans(v):
+    if v is None: return None
+    if isnum(v): return v
+    s = str(v).strip()
+    if s == "": return None
     try:
-        h, m, s = [int(x) for x in (time_s or "").strip().split(":")]
-        return dt.datetime(d.year, d.month, d.day, h, m, s)
-    except (ValueError, TypeError):
-        return None
+        f = float(s.replace(",", ""))
+        return int(f) if f == int(f) else f
+    except Exception:
+        return s
 
-
-def read_survey(raw: bytes):
-    """Parse the Tapal raw CSV into one record per submission (ObjectID)."""
-    text = raw.decode("utf-8-sig", errors="replace")
-    rows = list(csv.reader(io.StringIO(text)))
-    header = [h.strip() for h in rows[0]]
-    subs = {}
-    for r in rows[1:]:
-        rec = dict(zip(header, r))              # extra trailing fields are ignored
-        oid = (rec.get("ObjectID") or "").strip()
-        if not oid:
-            continue
-        store = clean(rec.get("Store"))
-        date_s = (rec.get("Date") or "").strip()
-        try:
-            d = dt.date.fromisoformat(date_s[:10])
-        except ValueError:
-            continue
-        if not store:
-            continue
-        s = subs.setdefault(oid, {"store": store, "date": d, "ts": None, "ans": {}})
-        s["ts"] = _parse_ts(rec.get("Time"), d) or s["ts"]
-        m = re.match(r"\s*Q(\d)\.", rec.get("Question") or "")
-        if m:
-            s["ans"]["Q" + m.group(1)] = (rec.get("Answer") or "").strip()
-    return list(subs.values())
-
-
-def pick_visits(subs):
-    """One visit per (store, date). Duplicates: latest submission that has answers."""
-    groups = {}
-    for s in subs:
-        groups.setdefault((norm(s["store"]), s["date"]), []).append(s)
-
-    visits, dups = {}, []
-    for (skey, d), lst in groups.items():
-        lst.sort(key=lambda s: s["ts"] or dt.datetime.min, reverse=True)
-        usable = [s for s in lst if s["ans"].get("Q1") or s["ans"].get("Q2")]
-        chosen = (usable or lst)[0]
-        visits[(skey, d)] = chosen
-        if len(lst) > 1:
-            identical = all(s["ans"] == lst[0]["ans"] for s in lst)
-            dups.append({
-                "Store": lst[0]["store"], "Date": d.isoformat(),
-                "Submissions": len(lst),
-                "Used": chosen["ts"].strftime("%H:%M:%S") if chosen["ts"] else "",
-                "Identical": "Yes" if identical else "No",
-            })
-    return visits, dups
-
-
-def match_stores(survey_keys, wb_keys):
-    wb_set = set(wb_keys)
-    result = {}
-    for k in survey_keys:
-        if k in wb_set:
-            result[k] = (k, "exact")
-            continue
-        best = difflib.get_close_matches(k, wb_keys, n=1, cutoff=FUZZY_CUTOFF)
-        result[k] = (best[0], "fuzzy") if best else (None, "unmatched")
-    return result
-
-
-# ----------------------------------------------------------------- sheet surgery
-def shift_formula(f, threshold, n):
-    def rep(m):
-        c = CI(m.group(2))
-        if c >= threshold:
-            c += n
-        return f"{m.group(1)}{L(c)}{m.group(3)}{m.group(4)}"
-    return REF_RE.sub(rep, f)
-
-
-def shift_rng(rng, threshold, n):
+def read_rows(data: bytes, filename: str):
+    """returns list of dict rows with keys ObjectID, City, Store, Date, Time, Question, Answer"""
     out = []
-    for part in rng.split(":"):
-        m = re.match(r"([A-Z]+)(\d+)$", part)
-        c = CI(m.group(1))
-        if c >= threshold:
-            c += n
-        out.append(f"{L(c)}{m.group(2)}")
-    return ":".join(out)
-
-
-def find_header_row(ws):
-    for r in range(1, 15):
-        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
-        if "LMT Store" in vals:
-            return r
-    raise ValueError(f"Sheet '{ws.title}': could not find the 'LMT Store' header row")
-
-
-def is_data_sheet(ws):
-    try:
-        find_header_row(ws)
-        return True
-    except ValueError:
-        return False
-
-
-def scan_headers(ws, hdr_row):
-    return {c: ws.cell(hdr_row, c).value for c in range(1, ws.max_column + 1)
-            if isinstance(ws.cell(hdr_row, c).value, str)}
-
-
-def insert_columns(ws, threshold, n, tbl, new_names, old_last, new_last):
-    """Insert n columns at `threshold` and keep formulas, table, merges, CF and widths in sync."""
-    merges = [str(m) for m in ws.merged_cells.ranges]
-    for m in merges:
-        if range_boundaries(m)[2] >= threshold:
-            ws.unmerge_cells(m)
-
-    cfs = [([str(r) for r in cf.sqref.ranges], list(cf.rules)) for cf in ws.conditional_formatting]
-    auto_ref = ws.auto_filter.ref
-
-    ws.insert_cols(threshold, n)
-
-    for row in ws.iter_rows():
-        for c in row:
-            if isinstance(c.value, str) and c.value.startswith("="):
-                v = shift_formula(c.value, threshold, n)
-                if old_last and new_last and old_last != new_last:
-                    v = v.replace(f":[{old_last}]]", f":[{new_last}]]")
-                c.value = v
-
-    for m in merges:
-        if range_boundaries(m)[2] >= threshold:
-            ws.merge_cells(shift_rng(m, threshold, n))
-
-    new_cf = ConditionalFormattingList()
-    for rngs, rules in cfs:
-        sq = " ".join(shift_rng(r, threshold, n) for r in rngs)
-        for rule in rules:
-            new_cf.add(sq, rule)
-    ws.conditional_formatting = new_cf
-
-    if auto_ref:
-        ws.auto_filter.ref = shift_rng(auto_ref, threshold, n)
-
-    dims = {}
-    for k, d in list(ws.column_dimensions.items()):
-        lo = d.min or CI(k)
-        hi = d.max or lo
-        for i in range(lo, min(hi, 200) + 1):
-            if d.width:
-                dims[i] = d.width
-    ws.column_dimensions.clear()
-    for i, w in dims.items():
-        j = i + n if i >= threshold else i
-        ws.column_dimensions[L(j)].width = w
-    if threshold - 1 in dims:
-        for i in range(n):
-            ws.column_dimensions[L(threshold + i)].width = dims[threshold - 1]
-
-    # table: extend ref, add columns after the last day column, drop stale sortState
-    min_c, min_r, max_c, max_r = range_boundaries(tbl.ref)
-    if max_c >= threshold:
-        max_c += n
-    tbl.ref = f"{L(min_c)}{min_r}:{L(max_c)}{max_r}"
-    if tbl.autoFilter is not None:
-        tbl.autoFilter.ref = tbl.ref
-    tbl.sortState = None
-    for tc in tbl.tableColumns:                      # e.g. Sum column's calculated formula
-        if tc.calculatedColumnFormula is not None and old_last and new_last:
-            txt = tc.calculatedColumnFormula.attr_text
-            tc.calculatedColumnFormula.attr_text = txt.replace(f":[{old_last}]]", f":[{new_last}]]")
-
-    names = [c.name for c in tbl.tableColumns]
-    idx = names.index(old_last)
-    tmpl = tbl.tableColumns[idx]
-    next_id = max(c.id for c in tbl.tableColumns) + 1
-    new_cols = []
-    for i, nm in enumerate(new_names):
-        tc = copy.copy(tmpl)
-        tc.id = next_id + i
-        tc.name = nm
-        tc.calculatedColumnFormula = None
-        tc.totalsRowFunction = None
-        tc.totalsRowLabel = None
-        new_cols.append(tc)
-    tbl.tableColumns[idx + 1: idx + 1] = new_cols
-
-
-def rename_table_column(tbl, old, new):
-    for c in tbl.tableColumns:
-        if c.name == old:
-            c.name = new
-
-
-# ----------------------------------------------------------------- per-sheet update
-def update_sheet(ws, kind, visits_for_wb, all_dates, log):
-    """kind = 'cs' (Collectible Summary) or 'dd' (DD 900gm Compile)."""
-    hdr_row = find_header_row(ws)
-    hdr = scan_headers(ws, hdr_row)
-    store_col = next(c for c, v in hdr.items() if v == "LMT Store")
-    total_col = next(c for c, v in hdr.items() if v in ("Sum", "Total Sale"))
-    status_col = next(c for c, v in hdr.items()
-                      if v == "Status" or (isinstance(v, str) and v.startswith(DD_STATUS_PREFIX)))
-    remarks_col = next(c for c, v in hdr.items()
-                       if v == "Remarks" or (isinstance(v, str) and v.startswith("Remarks (")))
-    day_re = CS_DAY_RE if kind == "cs" else DD_DAY_RE
-
-    def existing_days(h):
-        out = {}
-        for c, v in h.items():
-            m = day_re.match(v)
-            if m:
-                out[(int(m.group(1)), m.group(2).title())] = c
-        return out
-
-    days = existing_days(hdr)
-    old_last_col = max(days.values())
-    old_last_label = hdr[old_last_col]
-    new_dates = sorted({d for d in all_dates if day_key(d) not in days})
-    tbl = list(ws.tables.values())[0]
-
-    if new_dates:
-        n = len(new_dates)
-        new_labels = [cs_label(d) if kind == "cs" else dd_label(d) for d in new_dates]
-        new_last_label = new_labels[-1]
-        insert_columns(ws, total_col, n, tbl, new_labels, old_last_label, new_last_label)
-        for i, lab in enumerate(new_labels):
-            ws.cell(hdr_row, total_col + i).value = lab
-        for r in range(hdr_row, ws.max_row + 1):
-            src = ws.cell(r, total_col - 1)
-            for i in range(n):
-                ws.cell(r, total_col + i)._style = copy.copy(src._style)
-        log.append(f"Added {n} new day column(s) to '{ws.title}': "
-                   + ", ".join(d.strftime("%d-%b-%Y") for d in new_dates))
-        # DD: totals row for the new day columns
-        if kind == "dd":
-            total_row = next((r for r in range(hdr_row + 1, ws.max_row + 1)
-                              if ws.cell(r, 6).value == "Total"), None)
-            if total_row:
-                for i in range(n):
-                    col = total_col + i
-                    ws.cell(total_row, col).value = (
-                        f"=SUM({L(col)}{hdr_row + 1}:{L(col)}{total_row - 1})")
-        days = existing_days({c: ws.cell(hdr_row, c).value for c in range(1, ws.max_column + 1)
-                              if isinstance(ws.cell(hdr_row, c).value, str)})
-        hdr = scan_headers(ws, hdr_row)
-        total_col = next(c for c, v in hdr.items() if v in ("Sum", "Total Sale"))
-        status_col = next(c for c, v in hdr.items()
-                          if v == "Status" or (isinstance(v, str) and v.startswith(DD_STATUS_PREFIX)))
-        remarks_col = next(c for c, v in hdr.items()
-                           if v == "Remarks" or (isinstance(v, str) and v.startswith("Remarks (")))
-
-    # latest day in the sheet drives the status header rename (DD only)
-    latest_date = max(all_dates)
-    if kind == "dd":
-        old_status = hdr[status_col]
-        new_status = dd_status_label(latest_date)
-        if old_status != new_status:
-            ws.cell(hdr_row, status_col).value = new_status
-            rename_table_column(tbl, old_status, new_status)
-            log.append(f"Renamed stock status header to '{ws.title}' -> "
-                       f"{latest_date.strftime('%d-%b-%Y')}")
-        ws.cell(hdr_row, remarks_col).value = dd_remarks_label(latest_date)
-        old_status_for_wb = old_status
+    if filename.lower().endswith((".xlsx", ".xlsm")):
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        for ws in wb:
+            it = ws.iter_rows(values_only=True)
+            hdr = None
+            for r in it:
+                if hdr is None:
+                    if r and "Question" in r and "Answer" in r and "Store" in r: hdr = list(r)
+                    continue
+                out.append({h: r[i] for i, h in enumerate(hdr) if h})
+            if out: break
     else:
-        old_status_for_wb = None
+        text = data.decode("utf-8-sig", errors="replace")
+        rows = list(csv.reader(io.StringIO(text, newline="")))
+        hdr = rows[0]
+        for r in rows[1:]:
+            if not any(str(x).strip() for x in r): continue
+            r = list(r) + [""] * (len(hdr) - len(r))
+            out.append({h: r[i] for i, h in enumerate(hdr) if h})
+    return out
 
-    # write survey values
-    updated_rows = 0
-    status_changes = 0
-    matched_keys = set()
-    for r in range(hdr_row + 1, ws.max_row + 1):
-        skey = norm(ws.cell(r, store_col).value)
-        if not skey or skey not in visits_for_wb:
-            continue
-        matched_keys.add(skey)
-        vis = visits_for_wb[skey]
-        touched = False
-        for d, v in sorted(vis.items()):
-            col = days.get(day_key(d))
-            if col is None:
-                continue
-            num = to_num(v["ans"].get("Q2", ""))
-            if num is not None:
-                ws.cell(r, col).value = num
-                touched = True
-        if touched:
-            updated_rows += 1
-
-        latest_q1 = [v for d, v in sorted(vis.items()) if v["ans"].get("Q1", "").strip()]
-        if latest_q1:
-            v = latest_q1[-1]
-            st, oos = stock_status(v["ans"]["Q1"])
-            if st:
-                prev = ws.cell(r, status_col).value
-                ws.cell(r, status_col).value = st
-                rem = ws.cell(r, remarks_col)
-                if st == "Available" and rem.value == STOCK_FINISHED:
-                    rem.value = None
-                elif st == "Not Available" and (oos or prev == "Available") and not rem.value:
-                    rem.value = STOCK_FINISHED
-                if prev != st:
-                    status_changes += 1
-
-    # "Data is updated till ..." notes
-    note = f"updated till {latest_date.day} {MON[latest_date.month - 1]} {latest_date.year}"
-    for row in ws.iter_rows():
-        for c in row:
-            if isinstance(c.value, str) and UPDATED_TILL_RE.search(c.value):
-                c.value = UPDATED_TILL_RE.sub(note, c.value)
-
-    return {
-        "sheet": ws.title,
-        "new_dates": new_dates,
-        "rows_updated": updated_rows,
-        "status_changes": status_changes,
-        "old_status_header": old_status_for_wb,
-        "matched_keys": matched_keys,
-    }
+def parse_survey(data: bytes, filename: str):
+    subs = {}
+    for r in read_rows(data, filename):
+        oid, q = r.get("ObjectID"), r.get("Question")
+        if not oid or not q or r.get("Store") in (None, ""): continue
+        d = subs.setdefault(oid, dict(city=str(r["City"]).strip(), store=str(r["Store"]).strip(),
+                                       date=_to_date(r["Date"]), time=_to_time(r.get("Time") or "00:00:00"), ba=r.get("BA")))
+        d[str(q).strip()[:2]] = _ans(r.get("Answer"))
+    by = collections.OrderedDict()
+    for d in subs.values(): by.setdefault(d["store"], []).append(d)
+    info = collections.OrderedDict()
+    for st, L in by.items():
+        L.sort(key=lambda d: (d["date"], d["time"]))
+        daily = {}
+        for d in L:                                    # last submission of the day wins
+            if isnum(d.get("Q2")): daily[d["date"]] = d["Q2"]
+            else: daily.setdefault(d["date"], None)
+        last = L[-1]; q1, q2 = last.get("Q1"), last.get("Q2")
+        if isnum(q1) and q1 > 0: status = "Available"
+        elif q1 is None and isnum(q2) and q2 > 0: status = "Available"      # price blank but units sold
+        else: status = "Not Available"
+        info[norm(st)] = dict(name=st, city=last["city"], daily=daily, status=status,
+                              outstock=("out" in str(q1).lower()), lastdate=last["date"])
+    return info
 
 
-def process_workbook(raw_bytes, kind, survey_visits_by_key, all_dates, title):
-    """Update one master workbook. Returns (bytes, info dict)."""
-    wb = openpyxl.load_workbook(io.BytesIO(raw_bytes))
-    log = []
-    sheet_infos = []
+# ----------------------------------------------------------------------------- helpers
+def table_of(ws):
+    return list(ws.tables.values())[0]
 
-    # which survey stores map to which workbook store key (per sheet, all sheets together)
-    wb_keys = []
-    data_sheets = [ws for ws in wb.worksheets if is_data_sheet(ws)]
-    for ws in data_sheets:
-        hdr_row = find_header_row(ws)
-        store_col = next(c for c in range(1, ws.max_column + 1)
-                         if ws.cell(hdr_row, c).value == "LMT Store")
-        for r in range(hdr_row + 1, ws.max_row + 1):
-            k = norm(ws.cell(r, store_col).value)
-            if k:
-                wb_keys.append(k)
-    wb_keys = list(dict.fromkeys(wb_keys))
-    mapping = match_stores(list(survey_visits_by_key.keys()), wb_keys)
+def tbl_last_row(t):
+    return int(re.findall(r"\d+", t.ref.split(":")[1])[0])
 
-    visits_for_wb = {}
-    fuzzy, unmatched = [], []
-    for skey, (wkey, how) in mapping.items():
-        if how == "unmatched":
-            unmatched.append(skey)
-            continue
-        if how == "fuzzy":
-            fuzzy.append((skey, wkey))
-        visits_for_wb.setdefault(wkey, {}).update(survey_visits_by_key[skey])
+def tfs(obj, fn):
+    if obj is not None and getattr(obj, "attr_text", None): obj.attr_text = fn(obj.attr_text)
 
-    for ws in data_sheets:
-        info = update_sheet(ws, kind, visits_for_wb, all_dates, log)
-        sheet_infos.append(info)
+def parse_header(text, ref_year):
+    t = str(text)
+    m = re.search(r"\((\d+)(?:st|nd|rd|th) (\w+) (\d{4})\)", t)
+    if m: return datetime.datetime.strptime(f"{m.group(1)} {m.group(2)[:3]} {m.group(3)}", "%d %b %Y").date()
+    m = re.match(r"\s*(\d+)-(\w{3})", t)
+    d = datetime.datetime.strptime(f"{m.group(1)} {m.group(2)} {ref_year}", "%d %b %Y").date()
+    return d
 
-    # DD: stock status header is referenced by lookup formulas on other sheets
-    if kind == "dd":
-        old = sheet_infos[0]["old_status_header"]
-        new = dd_status_label(max(all_dates))
-        if old and old != new:
-            for ws in wb.worksheets:
-                for row in ws.iter_rows():
-                    for c in row:
-                        if isinstance(c.value, str) and c.value.startswith("=") and f"[{old}]" in c.value:
-                            c.value = c.value.replace(f"[{old}]", f"[{new}]")
+def make_header(kind, d):
+    return f"{d.day}-{d:%b}" if kind == "cs" else f"Sellout \n({ordn(d.day)} {d:%b} {d.year})"
 
-    # drop slicer names (slicers themselves are not preserved by openpyxl)
-    for name in list(wb.defined_names.keys()):
-        if name.startswith("Slicer_"):
-            del wb.defined_names[name]
+def replace_names(wb, pairs):
+    """bracket-delimited, collision-safe replacement of table column names in every formula"""
+    toks = [("[" + a + "]", "\x00%d\x00" % i, "[" + b + "]") for i, (a, b) in enumerate(pairs)]
+    def fn(s):
+        for a, tk, b in toks: s = s.replace(a, tk)
+        for a, tk, b in toks: s = s.replace(tk, b)
+        return s
+    for ws in wb:
+        for row in ws.iter_rows():
+            for c in row:
+                if isinstance(c.value, str) and c.value.startswith("="): c.value = fn(c.value)
+        for t in ws.tables.values():
+            for tc in t.tableColumns:
+                tfs(tc.calculatedColumnFormula, fn); tfs(tc.totalsRowFormula, fn)
+    return fn
 
-    wb.calculation = CalcProperties(fullCalcOnLoad=True)
-    add_log_sheet(wb, title, log, unmatched, fuzzy)
-
-    out = io.BytesIO()
-    wb.save(out)
-    return out.getvalue(), {"sheets": sheet_infos, "fuzzy": fuzzy, "unmatched": unmatched, "log": log}
+def set_dims(ws, c0, c1, first_vis, width):
+    """hide the empty leading date columns, show the rest"""
+    cd = ws.column_dimensions
+    for k in [k for k, v in cd.items() if v.min and v.max and not (v.max < c0 or v.min > c1)]:
+        del cd[k]
+    L = openpyxl.utils.get_column_letter
+    if first_vis > 0:
+        cd[L(c0)] = ColumnDimension(ws, index=L(c0), min=c0, max=c0 + first_vis - 1, width=width, hidden=True, customWidth=True)
+    cd[L(c0 + first_vis)] = ColumnDimension(ws, index=L(c0 + first_vis), min=c0 + first_vis, max=c1, width=width, hidden=False, customWidth=True)
 
 
-def add_log_sheet(wb, title, log, unmatched, fuzzy):
-    if "Update Log" in wb.sheetnames:
-        del wb["Update Log"]
-    ws = wb.create_sheet("Update Log")
-    ws.append([f"Update run: {title}", dt.datetime.now().strftime("%d-%b-%Y %H:%M")])
-    ws.append([])
-    for line in log:
-        ws.append([line])
-    if fuzzy:
-        ws.append([])
-        ws.append(["Fuzzy-matched store names (please verify):"])
-        for s, w in fuzzy:
-            ws.append([f"Survey: '{s}'  ->  Workbook: '{w}'"])
-    if unmatched:
-        ws.append([])
-        ws.append(["Survey stores NOT found in this workbook (not updated):"])
-        for s in unmatched:
-            ws.append([f"  {s}"])
-    ws.column_dimensions["A"].width = 110
-    ws["A1"].font = openpyxl.styles.Font(bold=True)
+def guess_channel(name):
+    n = name.lower()
+    return "IMT" if ("imtiaz" in n or n.startswith("spar") or "carrefour" in n or "metro" in n or n.startswith("csd")) else "LMT"
+
+CITY_FALLBACK = {  # city -> (region, zone) for cities that may not exist in the workbooks yet
+    "quetta": ("Sukkur", "South"), "muzaffarabad": ("Islamabad", "North"), "rawalpindi": ("Islamabad", "North"),
+    "daska": ("Gujranwala", "North"), "wazirabad": ("Gujranwala", "North"), "sahiwal": ("Faisalabad", "North"),
+    "rahim yar khan": ("Bahawalpur", "North"), "peshawar": ("Islamabad", "North"), "sialkot": ("Gujranwala", "North"),
+    "sargodha": ("Faisalabad", "North"), "jhelum": ("Gujranwala", "North"), "gujrat": ("Gujranwala", "North"),
+    "hyderabad": ("Hyderabad", "South"), "karachi": ("Karachi", "South"), "lahore": ("Lahore", "North"),
+    "multan": ("Multan", "North"), "faisalabad": ("Faisalabad", "North"), "islamabad": ("Islamabad", "North"),
+}
 
 
-# ----------------------------------------------------------------- public entry point
-def run_update(survey_csv: bytes, cs_xlsx: bytes, dd_xlsx: bytes):
-    subs = read_survey(survey_csv)
-    if not subs:
-        raise ValueError("No valid survey rows found in the CSV (check the file).")
-    visits, dups = pick_visits(subs)
+# ----------------------------------------------------------------------------- workbook context
+def load_ctx(cs_bytes, dd_bytes):
+    cwb = openpyxl.load_workbook(io.BytesIO(cs_bytes))
+    dwb = openpyxl.load_workbook(io.BytesIO(dd_bytes))
+    return cwb, dwb
 
-    by_store = {}
-    for (skey, d), v in visits.items():
-        by_store.setdefault(skey, {})[d] = v
-    all_dates = sorted({d for (_, d) in visits})
+def existing_stores(cwb, dwb):
+    s = {}
+    for n in ("GT", "KA"):
+        ws = cwb[n]
+        for r in range(2, tbl_last_row(table_of(ws)) + 1):
+            if ws.cell(r, 3).value: s[norm(ws.cell(r, 3).value)] = ws.cell(r, 3).value
+    ws = dwb["Compile"]; t = table_of(ws)
+    for r in range(7, tbl_last_row(t)):
+        if ws.cell(r, 4).value: s.setdefault(norm(ws.cell(r, 4).value), ws.cell(r, 4).value)
+    return s
 
-    cs_bytes, cs_info = process_workbook(cs_xlsx, "cs", by_store, all_dates, "Collectible Summary")
-    dd_bytes, dd_info = process_workbook(dd_xlsx, "dd", by_store, all_dates, "DD 900gm CP Survey")
+def city_map(cwb, dwb):
+    m = collections.defaultdict(collections.Counter)
+    for n in ("GT", "KA"):
+        ws = cwb[n]
+        for r in range(2, tbl_last_row(table_of(ws)) + 1):
+            if ws.cell(r, 3).value: m[norm(ws.cell(r, 2).value)][(ws.cell(r, 1).value, ws.cell(r, 4).value, ws.cell(r, 2).value)] += 1
+    return m
 
-    # per-store report for display
-    report = []
-    for skey, dates in sorted(by_store.items()):
-        name = next(v["store"] for v in dates.values())
-        q1 = [v for d, v in sorted(dates.items()) if v["ans"].get("Q1", "").strip()]
-        st = stock_status(q1[-1]["ans"]["Q1"])[0] if q1 else None
-        sold = []
-        for d, v in sorted(dates.items()):
-            num = to_num(v["ans"].get("Q2", ""))
-            sold.append(f"{d.strftime('%d-%b')}: {num if num is not None else '-'}")
-        report.append({
-            "Store": name,
-            "Days surveyed": ", ".join(d.strftime("%d-%b") for d in sorted(dates)),
-            "Units sold (Q2) by day": "; ".join(sold),
-            "Latest stock status": st or "-",
-        })
-    daily = {}
-    for (skey, d), v in visits.items():
-        num = to_num(v["ans"].get("Q2", ""))
-        if num is not None:
-            daily[d] = daily.get(d, 0) + num
-
-    return {
-        "daily_totals": daily,
-        "cs_bytes": cs_bytes,
-        "dd_bytes": dd_bytes,
-        "dates": all_dates,
-        "submissions": len(subs),
-        "stores_surveyed": len(by_store),
-        "duplicates": dups,
-        "cs_info": cs_info,
-        "dd_info": dd_info,
-        "report": report,
-    }
-
-
-# =============================================================================
-# Streamlit UI
-# =============================================================================
-st.set_page_config(page_title="Tapal Daily Survey Updater", layout="wide")
-st.title("Tapal DD 900gm Collectible – Daily Survey Updater")
-st.caption("Upload the raw survey CSV plus the two master workbooks. "
-           "Get back the two updated workbooks.")
-
-c1, c2, c3 = st.columns(3)
-survey_file = c1.file_uploader("1. Raw survey CSV", type=["csv"],
-                               help="Tapal_Survey_Question_... .csv")
-cs_file = c2.file_uploader("2. Collectible Summary master", type=["xlsx"])
-dd_file = c3.file_uploader("3. DD 900gm CP master", type=["xlsx"])
-
-ready = survey_file is not None and cs_file is not None and dd_file is not None
-if st.button("Update both files", type="primary", disabled=not ready):
-    with st.spinner("Matching stores, appending days and recalculating…"):
-        try:
-            st.session_state["result"] = run_update(
-                survey_file.getvalue(), cs_file.getvalue(), dd_file.getvalue())
-        except Exception as exc:  # show a readable message instead of a stack trace
-            st.session_state.pop("result", None)
-            st.error(f"Could not process the files: {exc}")
-
-res = st.session_state.get("result")
-if res:
-    last = max(res["dates"])
-    stamp = last.strftime("%d%b%Y")
-    cs_info, dd_info = res["cs_info"], res["dd_info"]
-    matched_cs = sum(len(s["matched_keys"]) for s in cs_info["sheets"])
-    st.success(f"Done. Added {', '.join(d.strftime('%d-%b') for d in res['dates'])} "
-               f"to both files.")
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Survey submissions", res["submissions"])
-    m2.metric("Stores surveyed", res["stores_surveyed"])
-    m3.metric("Stores matched in master", matched_cs)
-    m4.metric("Survey stores not found", len(cs_info["unmatched"]))
-
-    d1, d2 = st.columns(2)
-    d1.download_button("⬇ Download Collectible Summary (updated)",
-                       data=res["cs_bytes"],
-                       file_name=f"Collectible_Summary_BA_Stores_{stamp}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    d2.download_button("⬇ Download DD 900gm CP Survey (updated)",
-                       data=res["dd_bytes"],
-                       file_name=f"DD_900gm_Mug_CP_Survey_{stamp}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    t1, t2, t3, t4 = st.tabs(["Daily totals", "Store report", "Duplicates", "Needs review"])
-    with t1:
-        st.dataframe(pd.DataFrame(
-            [{"Date": d.strftime("%d-%b-%Y"), "Units sold (survey total)": v}
-             for d, v in sorted(res["daily_totals"].items())]),
-            hide_index=True, use_container_width=True)
-    with t2:
-        st.dataframe(pd.DataFrame(res["report"]), hide_index=True, use_container_width=True)
-    with t3:
-        if res["duplicates"]:
-            st.caption("Stores with more than one submission on the same day. The latest "
-                       "submission that has answers was used.")
-            st.dataframe(pd.DataFrame(res["duplicates"]), hide_index=True, use_container_width=True)
+def suggest_new(info, existing, cwb, dwb, alias=DEFAULT_ALIAS):
+    """-> (matched {survey_key: file_key}, review dataframe for unmatched stores)"""
+    matched, rows = {}, []
+    cm = city_map(cwb, dwb)
+    regions = sorted({k[0] for c in cm.values() for k in c if k[0]})
+    for k, v in info.items():
+        t = alias.get(k, k)
+        if t in existing: matched[k] = t; continue
+        c = v["city"].replace("_", " "); ck = norm(c)
+        if ck not in cm:
+            near = difflib.get_close_matches(ck, list(cm), 1, 0.85)
+            if near: ck = near[0]
+        if ck in cm:
+            reg, zone, city = cm[ck].most_common(1)[0][0]
         else:
-            st.info("No duplicate submissions.")
-    with t4:
-        if cs_info["fuzzy"] or dd_info["fuzzy"]:
-            st.warning("Store names matched by similarity (please verify):")
-            st.dataframe(pd.DataFrame(
-                [{"Survey name": s, "Master name": w} for s, w in cs_info["fuzzy"]]),
-                hide_index=True, use_container_width=True)
-        if cs_info["unmatched"]:
-            st.error("These survey stores are not in the master files and were NOT updated. "
-                     "Add them to the master first, then re-run:")
-            st.write(cs_info["unmatched"])
-        if not cs_info["fuzzy"] and not cs_info["unmatched"]:
-            st.info("All survey stores matched.")
+            reg, zone = CITY_FALLBACK.get(ck, ("", "")); city = c
+        close = difflib.get_close_matches(k, list(existing), 1, 0.8)
+        rows.append({"Survey store": v["name"], "Survey city": c, "Possible existing match": existing[close[0]] if close else "",
+                     "Action": ADD_NEW, "City": city, "Region": reg, "Zone": zone, "Channel": guess_channel(v["name"])})
+    return matched, pd.DataFrame(rows), regions
 
-with st.expander("How the update works"):
-    st.markdown(
-        "- **Sell-out:** Q2 (Units Sold) is written into a new day column for each store. "
-        "Blank answers are left empty.\n"
-        "- **Stock status:** Q1 (CP stock) above 0 → *Available*; 0, *Not Available* or "
-        "*Out Of Stock* → *Not Available*. The status header moves to the latest day.\n"
-        "- **Remarks:** *Stock finished* is added when a store goes from Available to "
-        "Not Available (or answers Out Of Stock), and removed when it becomes Available again.\n"
-        "- **Duplicates:** if a store has several submissions on one day, the latest one "
-        "with answers is used.\n"
-        "- **Existing history** (earlier days, totals, summary blocks) is not changed.\n"
-        "- Each output has an **Update Log** sheet listing what changed."
-    )
+
+# ----------------------------------------------------------------------------- core update
+def roll_window(ws, kind, spec, new_end, ref_year, report):
+    """make the 25 date columns end at new_end (shifting old values left if needed). returns new date list"""
+    t = table_of(ws); c0 = spec["date0"]
+    old_hdr = [ws.cell(spec["hdr"], c0 + i).value for i in range(WINDOW)]
+    old_end = parse_header(old_hdr[-1], ref_year)
+    if kind == "cs" and old_end > new_end and (old_end - new_end).days > 200: old_end = old_end.replace(year=old_end.year - 1)
+    new_end = max(new_end, old_end)
+    k = (new_end - old_end).days
+    dates = [new_end - datetime.timedelta(days=WINDOW - 1 - i) for i in range(WINDOW)]
+    new_hdr = [make_header(kind, d) for d in dates]
+    if k > 0:
+        last = spec["last_data_row"](ws, t)
+        dropped = 0
+        for r in range(spec["first"], last + 1):
+            vals = [ws.cell(r, c0 + i).value for i in range(WINDOW)]
+            dropped += sum(1 for v in vals[:min(k, WINDOW)] if v is not None)
+            nv = [vals[i + k] if i + k < WINDOW else None for i in range(WINDOW)]
+            for i in range(WINDOW): ws.cell(r, c0 + i).value = nv[i]
+        if dropped: report["warnings"].append(f"{ws.title}: {dropped} older sellout values fell out of the {WINDOW}-day window and were dropped.")
+    for i in range(WINDOW):
+        ws.cell(spec["hdr"], c0 + i).value = new_hdr[i]
+        t.tableColumns[c0 - 1 + i].name = new_hdr[i]
+    return dates, list(zip(old_hdr, new_hdr))
+
+def sum_row(ws, r, c0):
+    return sum(v for v in (ws.cell(r, c0 + i).value for i in range(WINDOW)) if isnum(v))
+
+def apply_row(ws, r, v, spec, dcol):
+    c0 = spec["date0"]
+    ws.cell(r, spec["status"]).value = v["status"]
+    for d, val in v["daily"].items():
+        if d in dcol and val is not None: ws.cell(r, c0 + dcol[d]).value = val
+    tot = sum_row(ws, r, c0)
+    ws.cell(r, spec["rem"]).value = "Stock finished" if v["status"] == "Not Available" and (tot > 0 or v["outstock"]) else None
+
+def first_visible(ws, spec, rows):
+    c0 = spec["date0"]
+    for i in range(WINDOW):
+        if any(ws.cell(r, c0 + i).value is not None for r in rows): return i
+    return 0
+
+def process(cs_bytes, dd_bytes, info, matched, review_df):
+    report = dict(warnings=[], sheets={})
+    cwb, dwb = load_ctx(cs_bytes, dd_bytes)
+    max_date = max(d for v in info.values() for d in v["daily"])
+    # survey store -> file key (user decisions override)
+    target = dict(matched); newrows = []
+    ex = existing_stores(cwb, dwb)
+    ex_by_name = {v: k for k, v in ex.items()}
+    for _, r in review_df.iterrows():
+        k = norm(r["Survey store"])
+        if r["Action"] != ADD_NEW and r["Action"] in ex_by_name: target[k] = ex_by_name[r["Action"]]
+        else:
+            if not r["Region"] or not r["Zone"] or r["Channel"] not in ("LMT", "IMT"):
+                raise ValueError(f"Please complete Region / Zone / Channel for new store: {r['Survey store']}")
+            newrows.append(r)
+    byfile = {}
+    for sk, fk in target.items(): byfile[fk] = info[sk]
+    # ---- Collectible ----
+    cs_spec = dict(date0=7, hdr=1, first=2, status=6, rem=33, last_data_row=lambda ws, t: tbl_last_row(t))
+    all_pairs_cs = []
+    for sheet, chan in (("GT", "LMT"), ("KA", "IMT")):
+        ws = cwb[sheet]; t = table_of(ws)
+        dates, pairs = roll_window(ws, "cs", cs_spec, max_date, max_date.year, report)
+        replace_names(cwb, [p for p in pairs if p[0] != p[1]])
+        dcol = {d: i for i, d in enumerate(dates)}
+        for v in info.values():
+            for d in v["daily"]:
+                if d < dates[0]: report["warnings"].append(f"{v['name']}: {d} is older than the {WINDOW}-day window - skipped.")
+        maxr = tbl_last_row(t); upd = 0
+        for r in range(2, maxr + 1):
+            n = ws.cell(r, 3).value
+            if n and norm(n) in byfile: apply_row(ws, r, byfile[norm(n)], cs_spec, dcol); upd += 1
+        nxt = max(r for r in range(2, maxr + 1) if ws.cell(r, 3).value) + 1; add = 0
+        regions_in_summary = {str(ws.cell(r, 35).value).strip() for r in range(1, 40) if ws.cell(r, 35).value}
+        for r_ in newrows:
+            if r_["Channel"] != chan: continue
+            if nxt > maxr:                                    # extend the table by one row
+                for c in range(1, 34): ws.cell(maxr + 1, c)._style = copy.copy(ws.cell(maxr, c)._style)
+                ws.cell(maxr + 1, 32).value = ws.cell(maxr, 32).value
+                for row in ws.iter_rows(min_col=35, max_col=39):
+                    for c in row:
+                        if isinstance(c.value, str) and c.value.startswith("="): c.value = c.value.replace(f"${maxr}", f"${maxr + 1}")
+                maxr += 1; t.ref = re.sub(r"\d+$", str(maxr), t.ref)
+            ws.cell(nxt, 1).value = r_["Region"]; ws.cell(nxt, 2).value = r_["City"]; ws.cell(nxt, 3).value = r_["Survey store"]
+            ws.cell(nxt, 4).value = r_["Zone"]; ws.cell(nxt, 5).value = chan
+            apply_row(ws, nxt, info[norm(r_["Survey store"])], cs_spec, dcol)
+            if r_["Region"] not in regions_in_summary:
+                report["warnings"].append(f"{sheet}: region '{r_['Region']}' is not in the summary block, so it is not counted there.")
+            nxt += 1; add += 1
+        for row in ws.iter_rows(min_col=35, max_col=39):
+            for c in row:
+                if isinstance(c.value, str) and "Data is updated" in c.value:
+                    c.value = re.sub(r"Data is updated[^\n]*?\.", f"Data is updated till {max_date.day} {max_date:%b %Y}.", c.value, 1)
+        rows = [r for r in range(2, nxt)]
+        fv = first_visible(ws, cs_spec, rows)
+        set_dims(ws, 7, 31, fv, 9.44)
+        report["sheets"][sheet] = dict(updated=upd, added=add, window=f"{dates[0]:%d %b} - {dates[-1]:%d %b %Y}")
+    cwb.calculation.fullCalcOnLoad = True
+    # ---- DD ----
+    ws = dwb["Compile"]; t = table_of(ws); tname = t.name
+    dd_spec = dict(date0=8, hdr=6, first=7, status=7, rem=34,
+                   last_data_row=lambda ws, t: tbl_last_row(t) - 1)
+    old_status = ws["G6"].value
+    dates, pairs = roll_window(ws, "dd", dd_spec, max_date, max_date.year, report)
+    new_status = f"DD 900gm CP Stock Status\n({ordn(max_date.day)} {max_date:%b %Y})"
+    ws["G6"].value = new_status; t.tableColumns[6].name = new_status
+    ws["AH6"].value = f"Remarks ({max_date:%d/%m/%Y})"
+    replace_names(dwb, [p for p in pairs if p[0] != p[1]] + [(old_status, new_status)])
+    dcol = {d: i for i, d in enumerate(dates)}
+    tot = tbl_last_row(t); last = tot - 1; NC = 34
+    upd = 0
+    for r in range(7, last + 1):
+        n = ws.cell(r, 4).value
+        if n and norm(n) in byfile: apply_row(ws, r, byfile[norm(n)], dd_spec, dcol); upd += 1
+    add = len(newrows)
+    if add:
+        totrow = [(ws.cell(tot, c).value, copy.copy(ws.cell(tot, c)._style)) for c in range(1, NC + 1)]
+        tpl = [copy.copy(ws.cell(last, c)._style) for c in range(1, NC + 1)]
+        th, tp = ws.row_dimensions[tot].height, ws.row_dimensions[last].height
+        for i, r_ in enumerate(newrows):
+            rr = tot + i
+            for c in range(1, NC + 1): ws.cell(rr, c)._style = copy.copy(tpl[c - 1]); ws.cell(rr, c).value = None
+            ws.row_dimensions[rr].height = tp
+            ws.cell(rr, 2).value = r_["Region"]; ws.cell(rr, 3).value = r_["City"]; ws.cell(rr, 4).value = r_["Survey store"]
+            ws.cell(rr, 5).value = r_["Zone"]; ws.cell(rr, 6).value = r_["Channel"]
+            apply_row(ws, rr, info[norm(r_["Survey store"])], dd_spec, dcol)
+            ws.cell(rr, 33).value = ws.cell(last, 33).value
+        newtot, newlast = tot + add, tot + add - 1
+        for c in range(1, NC + 1):
+            val, sty = totrow[c - 1]; cell = ws.cell(newtot, c); cell._style = sty
+            cell.value = val
+        ws.row_dimensions[newtot].height = th
+        last, tot = newlast, newtot
+    for c in range(1, NC + 1):                                 # (re)write total-row ranges
+        v = ws.cell(tot, c).value
+        if isinstance(v, str) and v.startswith("="):
+            ws.cell(tot, c).value = re.sub(r"([A-Z]{1,2})7:([A-Z]{1,2})\d+", lambda m: f"{m.group(1)}7:{m.group(2)}{last}", v)
+    t.ref = re.sub(r"\d+$", str(tot), t.ref)
+    if t.autoFilter is not None: t.autoFilter.ref = re.sub(r"\d+$", str(last), t.autoFilter.ref)
+    t.sortState = None
+    # keep the table filter view (e.g. Channel = LMT) consistent for the new rows
+    fvals = None
+    if t.autoFilter is not None:
+        for fc in t.autoFilter.filterColumn:
+            if fc.colId == 5 and fc.filters is not None: fvals = list(fc.filters.filter)
+    for r in range(7, last + 1):
+        ws.row_dimensions[r].hidden = bool(fvals) and ws.cell(r, 6).value not in fvals
+    fv = first_visible(ws, dd_spec, range(7, last + 1))
+    set_dims(ws, 8, 32, fv, 10.44)
+    dwb.calculation.fullCalcOnLoad = True
+    report["sheets"]["DD Compile"] = dict(updated=upd, added=add, window=f"{dates[0]:%d %b} - {dates[-1]:%d %b %Y}")
+    # ---- save + restore DD slicers ----
+    b1 = io.BytesIO(); cwb.save(b1)
+    b2 = io.BytesIO(); dwb.save(b2)
+    dd_out = restore_slicers(dd_bytes, b2.getvalue())
+    name_dd = f"DD_900gm_Mug_CP_Survey__{ordn(max_date.day)}_{max_date:%b}_{max_date.year}_.xlsx"
+    return b1.getvalue(), dd_out, name_dd, report
+
+
+# ----------------------------------------------------------------------------- keep slicers (openpyxl drops them)
+def restore_slicers(src_bytes, staged_bytes):
+    zs = zipfile.ZipFile(io.BytesIO(src_bytes))
+    names = zs.namelist()
+    parts = [n for n in names if n.startswith(("xl/slicers/", "xl/slicerCaches/", "xl/drawings/")) and not n.endswith("/")]
+    if not any(n.startswith("xl/slicers/") for n in parts): return staged_bytes
+    st = zipfile.ZipFile(io.BytesIO(staged_bytes)); files = {n: st.read(n) for n in st.namelist()}
+    # which sheet holds the slicers in the source
+    sheet_file = None
+    for n in names:
+        if n.startswith("xl/worksheets/_rels/") and b"/slicer" in zs.read(n) or (n.startswith("xl/worksheets/_rels/") and b"slicers/" in zs.read(n)):
+            sheet_file = n.split("/")[-1].replace(".rels", ""); break
+    if not sheet_file: return staged_bytes
+    for n in parts: files[n] = zs.read(n)
+    ctypes = {"xl/drawings/": "application/vnd.openxmlformats-officedocument.drawing+xml",
+              "xl/slicers/": "application/vnd.ms-excel.slicer+xml", "xl/slicerCaches/": "application/vnd.ms-excel.slicerCache+xml"}
+    ct = files["[Content_Types].xml"].decode(); add = ""
+    for n in parts:
+        if n.endswith(".rels"): continue
+        for p, typ in ctypes.items():
+            if n.startswith(p) and f'PartName="/{n}"' not in ct: add += f'<Override PartName="/{n}" ContentType="{typ}"/>'
+    files["[Content_Types].xml"] = ct.replace("</Types>", add + "</Types>").encode()
+    # sheet rels / xml
+    rel_p = f"xl/worksheets/_rels/{sheet_file}.rels"
+    src_rel = zs.read(rel_p).decode()
+    drawing_t = re.search(r'Target="([^"]*drawings/[^"]+)"', src_rel).group(1).split("drawings/")[-1]
+    slicer_t = re.search(r'Target="([^"]*slicers/[^"]+)"', src_rel).group(1).split("slicers/")[-1]
+    r = files[rel_p].decode()
+    r = r.replace("</Relationships>", f'<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="/xl/drawings/{drawing_t}" Id="rId90"/>'
+                  f'<Relationship Type="http://schemas.microsoft.com/office/2007/relationships/slicer" Target="/xl/slicers/{slicer_t}" Id="rId91"/></Relationships>')
+    files[rel_p] = r.encode()
+    sp = f"xl/worksheets/{sheet_file}"; s = files[sp].decode()
+    root = re.match(r"<worksheet[^>]*>", s).group(0)
+    if "xmlns:r=" not in root:
+        s = s.replace(root, root[:-1] + ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">', 1)
+    s = s.replace("<tableParts", '<drawing r:id="rId90"/><tableParts', 1)
+    s = s.replace("</worksheet>", '<extLst><ext uri="{3A4CF648-6AED-40f4-86FF-DC5316D8AED3}" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main">'
+                  '<x14:slicerList xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:slicer r:id="rId91"/></x14:slicerList></ext></extLst></worksheet>')
+    files[sp] = s.encode()
+    # workbook level slicer caches
+    wrel = zs.read("xl/_rels/workbook.xml.rels").decode()
+    caches = [m for m in re.findall(r'<Relationship [^>]*>', wrel) if "slicerCache" in m]
+    wr = files["xl/_rels/workbook.xml.rels"].decode(); items = ""; k = 90
+    for m in caches:
+        tgt = re.search(r'Target="([^"]+)"', m).group(1).split("slicerCaches/")[-1]
+        wr = wr.replace("</Relationships>", f'<Relationship Type="http://schemas.microsoft.com/office/2007/relationships/slicerCache" Target="/xl/slicerCaches/{tgt}" Id="rId{k}"/></Relationships>')
+        items += f'<x14:slicerCache r:id="rId{k}"/>'; k += 1
+    files["xl/_rels/workbook.xml.rels"] = wr.encode()
+    w = files["xl/workbook.xml"].decode()
+    w = w.replace("</workbook>", '<extLst><ext uri="{46BE6895-7355-4a93-B00E-2C351335B9C9}" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main">'
+                  '<x15:slicerCaches xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                  + items + "</x15:slicerCaches></ext></extLst></workbook>")
+    files["xl/workbook.xml"] = w.encode()
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", files["[Content_Types].xml"])
+        for n, b in files.items():
+            if n != "[Content_Types].xml": z.writestr(n, b)
+    return out.getvalue()
+
+
+# ----------------------------------------------------------------------------- Streamlit UI
+def main():
+    import streamlit as st
+    st.set_page_config(page_title="Tapal DD 900gm - Survey Appender", page_icon="📊", layout="wide")
+    st.title("📊 Tapal DD 900gm Collectible – Survey Appender")
+    st.caption("Upload the new survey export and your two current workbooks. New dates and stores are appended; "
+               "everything else in the files is kept.")
+    c1, c2, c3 = st.columns(3)
+    sv = c1.file_uploader("1️⃣ New survey (CSV or XLSX)", type=["csv", "xlsx"])
+    cs = c2.file_uploader("2️⃣ Collectible Summary - BA Stores (xlsx)", type=["xlsx"])
+    dd = c3.file_uploader("3️⃣ DD 900gm Mug CP Survey (xlsx)", type=["xlsx"])
+    if not (sv and cs and dd):
+        st.info("Upload all three files to continue."); return
+    sv_b, cs_b, dd_b = sv.getvalue(), cs.getvalue(), dd.getvalue()
+    try:
+        info = parse_survey(sv_b, sv.name)
+    except Exception as e:
+        st.error(f"Could not read the survey file: {e}"); return
+    if not info: st.error("No survey rows found."); return
+    dts = sorted({d for v in info.values() for d in v["daily"]})
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Stores in survey", len(info)); m2.metric("Dates", len(dts)); m3.metric("Last date", f"{dts[-1]:%d %b %Y}")
+    st.write("Dates found: " + ", ".join(f"{d:%d %b}" for d in dts))
+    cwb, dwb = load_ctx(cs_b, dd_b)
+    ex = existing_stores(cwb, dwb)
+    matched, review, regions = suggest_new(info, ex, cwb, dwb)
+    st.success(f"{len(matched)} survey stores matched to stores already in your files.")
+    if len(review):
+        st.subheader("Stores not found in your files")
+        st.caption("Keep **Add as new store** to append them, or pick the existing store they correspond to. "
+                   "Check Region / Zone / Channel (LMT = old GT sheet, IMT = KA sheet).")
+        options = [ADD_NEW] + sorted(ex.values(), key=str.lower)
+        review = st.data_editor(review, hide_index=True, use_container_width=True, key="rev", disabled=["Survey store", "Survey city", "Possible existing match"],
+                                column_config={"Action": st.column_config.SelectboxColumn(options=options, required=True),
+                                               "Region": st.column_config.SelectboxColumn(options=[""] + regions),
+                                               "Zone": st.column_config.SelectboxColumn(options=["", "North", "South"]),
+                                               "Channel": st.column_config.SelectboxColumn(options=["LMT", "IMT"])})
+    if st.button("▶ Append data and build files", type="primary"):
+        try:
+            with st.spinner("Updating workbooks..."):
+                cs_out, dd_out, dd_name, rep = process(cs_b, dd_b, info, matched, review)
+            st.session_state["out"] = (cs_out, dd_out, dd_name, rep)
+        except Exception as e:
+            st.error(str(e)); st.session_state.pop("out", None)
+    if "out" in st.session_state:
+        cs_out, dd_out, dd_name, rep = st.session_state["out"]
+        st.subheader("Done")
+        st.dataframe(pd.DataFrame(rep["sheets"]).T.rename(columns={"updated": "Stores updated", "added": "New stores added", "window": "Date window"}))
+        for w in rep["warnings"]: st.warning(w)
+        d1, d2 = st.columns(2)
+        d1.download_button("⬇ Collectible_Summary_-_BA_Stores.xlsx", cs_out, "Collectible_Summary_-_BA_Stores.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        d2.download_button(f"⬇ {dd_name}", dd_out, dd_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.caption("Open in Excel – formulas recalculate on open.")
+
+if __name__ == "__main__":
+    main()
